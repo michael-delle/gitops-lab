@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# lab — task runner for gitops-lab.
+#
+# Usage: ./lab <command> [args]
+# Run `./lab help` for the list of commands.
+#
+# Adding a command: write a `cmd_<name>` function and a line in cmd_help.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# --- output helpers ------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  BOLD=$'\e[1m' DIM=$'\e[2m' RED=$'\e[31m' GREEN=$'\e[32m' YELLOW=$'\e[33m' RESET=$'\e[0m'
+else
+  BOLD='' DIM='' RED='' GREEN='' YELLOW='' RESET=''
+fi
+
+info() { printf '%s\n' "${DIM}›${RESET} $*"; }
+ok()   { printf '%s\n' "${GREEN}✓${RESET} $*"; }
+warn() { printf '%s\n' "${YELLOW}!${RESET} $*" >&2; }
+die()  { printf '%s\n' "${RED}✗${RESET} $*" >&2; exit 1; }
+
+# Run a command with a time limit (macOS has no `timeout` by default).
+with_timeout() {
+  local seconds=$1; shift
+  perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$seconds" "$@"
+}
+
+# --- commands ------------------------------------------------------------------
+
+cmd_help() {
+  cat <<EOF
+${BOLD}gitops-lab${RESET} task runner
+
+${BOLD}Usage:${RESET} ./lab <command> [args]
+
+${BOLD}Commands:${RESET}
+  commit [--dry-run]   Generate a commit message for STAGED changes with Claude
+                       (Codex as fallback), review it, then commit.
+                       --dry-run prints the message without committing.
+  help                 Show this help.
+
+${BOLD}Environment:${RESET}
+  LAB_CLAUDE_MODEL     Claude model for commit messages (default: haiku)
+  LAB_CODEX_MODEL      Codex model (default: Codex's configured default)
+  LAB_AI_TIMEOUT       Seconds to wait for each AI provider (default: 90)
+EOF
+}
+
+# --- commit --------------------------------------------------------------------
+
+COMMIT_MSG_FILE="$ROOT/.git/LAB_COMMIT_MSG"
+MAX_DIFF_BYTES=60000
+
+commit_prompt() {
+  local diff_bytes
+  diff_bytes=$(git diff --cached | wc -c | tr -d ' ')
+
+  cat <<'EOF'
+Write a git commit message for the staged changes below.
+
+Rules:
+- Conventional Commits: `<type>(<optional scope>): <summary>`.
+  Types: feat, fix, docs, chore, refactor, test, ci, build, perf, style.
+- Subject line: imperative mood, lowercase after the colon, no trailing period,
+  at most 72 characters.
+- Add a body (after one blank line) only if the WHY is not obvious from the
+  subject. Wrap the body at 72 characters. Use short "- " bullets if listing.
+- Match the style of the recent commits shown.
+- Output ONLY the commit message. No code fences, no preamble, no commentary.
+
+EOF
+  printf 'Recent commits:\n'
+  git log --format='%s' -10 2>/dev/null || true
+  printf '\nFiles changed:\n'
+  git diff --cached --stat
+  printf '\nDiff:\n'
+  if (( diff_bytes > MAX_DIFF_BYTES )); then
+    git diff --cached | head -c "$MAX_DIFF_BYTES"
+    printf '\n[diff truncated: %s of %s bytes shown]\n' "$MAX_DIFF_BYTES" "$diff_bytes"
+  else
+    git diff --cached
+  fi
+}
+
+# Strip code fences and surrounding blank lines the model may add.
+clean_message() {
+  sed -e '/^```/d' | awk 'NF { found=1 } found' | sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}'
+}
+
+generate_with_claude() {
+  local prompt_file=$1 out_file=$2
+  command -v claude >/dev/null || return 1
+  with_timeout "${LAB_AI_TIMEOUT:-90}" claude -p \
+    --model "${LAB_CLAUDE_MODEL:-haiku}" \
+    --system-prompt "You write concise, accurate git commit messages. You output only the commit message." \
+    --no-session-persistence \
+    --tools "" \
+    < "$prompt_file" 2>/dev/null | clean_message > "$out_file" || return 1
+  [[ -s "$out_file" ]]
+}
+
+generate_with_codex() {
+  local prompt_file=$1 out_file=$2 raw
+  command -v codex >/dev/null || return 1
+  raw=$(mktemp)
+  local model_args=()
+  [[ -n "${LAB_CODEX_MODEL:-}" ]] && model_args=(-m "$LAB_CODEX_MODEL")
+  with_timeout "${LAB_AI_TIMEOUT:-90}" codex exec \
+    ${model_args[@]+"${model_args[@]}"} \
+    --sandbox read-only \
+    --ephemeral \
+    --color never \
+    -o "$raw" \
+    - < "$prompt_file" >/dev/null 2>&1 || { rm -f "$raw"; return 1; }
+  clean_message < "$raw" > "$out_file"
+  rm -f "$raw"
+  [[ -s "$out_file" ]]
+}
+
+# Try Claude, then Codex. Prints the provider name on success.
+generate_message() {
+  local prompt_file=$1 out_file=$2
+  info "Asking Claude (${LAB_CLAUDE_MODEL:-haiku})…" >&2
+  if generate_with_claude "$prompt_file" "$out_file"; then
+    echo "Claude"; return 0
+  fi
+  warn "Claude failed — falling back to Codex"
+  if generate_with_codex "$prompt_file" "$out_file"; then
+    echo "Codex"; return 0
+  fi
+  return 1
+}
+
+cmd_commit() {
+  local dry_run=false
+  case "${1:-}" in
+    --dry-run) dry_run=true ;;
+    "") ;;
+    *) die "unknown option for commit: $1" ;;
+  esac
+
+  git diff --cached --quiet && die "Nothing staged. Stage what you want to commit with \`git add\` first."
+
+  # The diff is about to leave this machine — scan it BEFORE sending it anywhere.
+  command -v gitleaks >/dev/null || die "gitleaks is not installed; refusing to send an unscanned diff to an AI provider."
+  info "Scanning staged changes with gitleaks…"
+  if ! gitleaks git --pre-commit --staged --redact --no-banner . >/dev/null 2>&1; then
+    gitleaks git --pre-commit --staged --redact --no-banner --verbose . >&2 || true
+    die "gitleaks found a possible secret in the staged changes. Nothing was sent to an AI provider."
+  fi
+
+  local provider choice
+  # Globals so the EXIT trap can still see them after this function returns.
+  prompt_file=$(mktemp)
+  msg_file=$(mktemp)
+  trap 'rm -f "$prompt_file" "$msg_file"' EXIT
+  commit_prompt > "$prompt_file"
+
+  while true; do
+    if ! provider=$(generate_message "$prompt_file" "$msg_file"); then
+      warn "Both Claude and Codex failed. Opening your editor for a manual message."
+      $dry_run && exit 1
+      git commit
+      exit $?
+    fi
+
+    printf '\n%s\n' "${BOLD}Commit message${RESET} ${DIM}(from $provider)${RESET}"
+    printf '%s\n' "${DIM}────────────────────────────────────────────${RESET}"
+    cat "$msg_file"
+    printf '%s\n' "${DIM}────────────────────────────────────────────${RESET}"
+
+    local subject_len
+    subject_len=$(head -n1 "$msg_file" | wc -m | tr -d ' ')
+    (( subject_len - 1 > 72 )) && warn "Subject line is $((subject_len - 1)) characters (limit 72)."
+
+    if $dry_run; then
+      exit 0
+    fi
+
+    printf '%s ' "[y]es, commit / [e]dit / [r]egenerate / [n]o?"
+    read -r choice < /dev/tty
+    case "$choice" in
+      y|Y|yes) break ;;
+      e|E|edit)
+        cp "$msg_file" "$COMMIT_MSG_FILE"
+        git commit -e -F "$COMMIT_MSG_FILE" && rm -f "$COMMIT_MSG_FILE"
+        exit $?
+        ;;
+      r|R) info "Regenerating…" ;;
+      *) info "Aborted. Nothing committed."; exit 0 ;;
+    esac
+  done
+
+  cp "$msg_file" "$COMMIT_MSG_FILE"
+  if git commit -F "$COMMIT_MSG_FILE"; then
+    rm -f "$COMMIT_MSG_FILE"
+    ok "Committed."
+  else
+    warn "Commit failed (a pre-commit hook may have modified files — re-stage and retry)."
+    warn "Your message is saved. Reuse it with: git commit -F .git/LAB_COMMIT_MSG"
+    exit 1
+  fi
+}
+
+# --- dispatch ------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  if declare -F "cmd_${cmd//-/_}" >/dev/null; then
+    "cmd_${cmd//-/_}" "$@"
+  else
+    warn "Unknown command: $cmd"
+    cmd_help
+    exit 1
+  fi
+}
+
+main "$@"
