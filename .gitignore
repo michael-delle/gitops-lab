@@ -1,0 +1,35 @@
+# --- Cluster credentials -----------------------------------------------------
+# k3d writes to ~/.kube/config, but never let an exported kubeconfig in.
+kubeconfig*
+*.kubeconfig
+
+# --- Encryption keys ---------------------------------------------------------
+# SOPS/age private keys. The PUBLIC recipient lives in .sops.yaml and is safe.
+*.agekey
+keys.txt
+# Sealed Secrets controller key backups (kubeseal --fetch-cert is fine; the
+# private key backup is not).
+sealed-secrets-key*
+*.key
+*.pem
+
+# Decrypted working copies of SOPS files
+*.dec.yaml
+*.decrypted.*
+
+# --- Environment / tokens ----------------------------------------------------
+.env
+.env.*
+!.env.example
+.envrc
+
+# --- Local artifacts ---------------------------------------------------------
+*.tgz
+tmp/
+.cache/
+
+# --- OS / editor -------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
